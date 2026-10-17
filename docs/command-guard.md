@@ -6,14 +6,14 @@ or sending nonempty input to a running process. Empty `write_stdin` polls do not
 invoke the checker.
 
 ```sh
-export BUT_COMMAND_GUARD='["/trusted/guard-env/bin/python","-I","/trusted/veltra-command-guard.py"]'
+export BUT_COMMAND_GUARD='["/trusted/guard-env/bin/python","-I","-X","utf8","/trusted/veltra-command-guard.py"]'
 browser
 ```
 
 On Windows, use JSON-escaped paths or forward slashes:
 
 ```powershell
-$env:BUT_COMMAND_GUARD = '["C:/trusted/guard-env/Scripts/python.exe","-I","C:/trusted/veltra-command-guard.py"]'
+$env:BUT_COMMAND_GUARD = '["C:/trusted/guard-env/Scripts/python.exe","-I","-X","utf8","C:/trusted/veltra-command-guard.py"]'
 browser
 ```
 
@@ -24,18 +24,24 @@ dependencies outside the agent's writable workspace.
 
 ## Checker contract
 
-The checker receives the existing `PreToolUse` JSON format on stdin:
+The checker receives the existing `PreToolUse` JSON format as UTF-8 on stdin:
 
 ```json
 {
   "hookEventName": "PreToolUse",
+  "callId": "call-123",
   "toolName": "exec_command",
   "toolInput": {
     "command": ["sh", "-c", "echo hello"],
-    "cwd": "/workspace"
+    "cwd": "/workspace",
+    "env": {}
   }
 }
 ```
+
+For process starts, `env` contains the proposed per-command environment overrides,
+not the full inherited environment. The checker must consider these along with
+the command and working directory; overrides can change what a command executes.
 
 For `write_stdin`, `command` and `cwd` identify the original process, and
 `toolInput` also contains `session_id` and the proposed `chars`. The checker must
@@ -47,9 +53,12 @@ return JSON with an explicit boolean decision and exit successfully:
 
 `{"continue": false}` denies execution. An invalid configuration, failed checker,
 missing decision, malformed JSON, output exceeding 8 KiB, or a five-second timeout
-also denies execution. Checker stderr and raw output are not included in the
-agent's error message. There is no decision cache: each process start and each
-nonempty input write is checked again.
+also denies execution. Cancellation interrupts a pending check without starting
+the command. Invalid configuration and checker failures produce fixed diagnostic
+categories on Terminal's stderr; raw checker stdout, stderr, and response reasons
+are suppressed because they can contain command secrets. These diagnostics are
+not included in the agent's error message. There is no decision cache: each
+process start and each nonempty input write is checked again.
 
 Unlike general lifecycle hooks, this security gate requires an explicit allow
 decision; a missing or failed check never permits the command.
@@ -69,9 +78,13 @@ uv pip install --python /trusted/guard-env/bin/python veltra-agent==0.4.0
 ```
 
 Configure `BUT_COMMAND_GUARD` as above. Python's `-I` option prevents imports from
-the task's working directory and ignores Python environment overrides. The
-adapter inspects without executing the command. It uses a temporary directory
-for Veltra's policy lookup and audit file so a task-controlled `veltra.config.json`
+the task's working directory and ignores Python environment overrides. Use
+`-X utf8` as shown so Veltra's temporary audit file also supports non-ASCII
+commands on Windows. The adapter reads at most 1 MiB of UTF-8 input and inspects without executing the
+command. It denies per-command environment overrides because Veltra's text rules
+cannot validate their execution effects. Terminal's inherited environment must
+therefore be trusted. It uses a temporary directory for Veltra's policy lookup
+and audit file so a task-controlled `veltra.config.json`
 cannot disable the check and command text is not left in the workspace.
 
 The adapter denies nonempty interactive input because Veltra's checker accepts
@@ -87,7 +100,9 @@ isolation and restricted credentials when those execution capabilities require
 a stronger boundary.
 
 The adapter uses Veltra's published local inspection API and does not send commands
-to its hosted service.
+to its hosted service. Malformed input or a checker dependency failure returns a
+deny verdict with a nonzero exit status, distinguishing a failed check from an
+ordinary policy denial without printing sensitive exception details.
 
 With `BUT_COMMAND_GUARD` configured as above, run the optional end-to-end Rust test:
 

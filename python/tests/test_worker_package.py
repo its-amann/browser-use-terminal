@@ -1014,7 +1014,7 @@ def test_veltra_guard_denies_malformed_input(tmp_path: Path, payload: str) -> No
         timeout=5,
     )
 
-    assert response.returncode == 0, response.stderr
+    assert response.returncode == 1, response.stderr
     assert json.loads(response.stdout)["continue"] is False
 
 
@@ -1036,5 +1036,77 @@ def test_veltra_guard_denies_when_dependency_is_unavailable(tmp_path: Path) -> N
         timeout=5,
     )
 
-    assert response.returncode == 0, response.stderr
+    assert response.returncode == 1, response.stderr
     assert json.loads(response.stdout)["continue"] is False
+
+
+def test_veltra_guard_reads_utf8_under_a_legacy_stdin_encoding(tmp_path: Path) -> None:
+    pytest.importorskip("veltra_agent.guardrail")
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    response = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "utf8",
+            "-c",
+            (
+                "import io, runpy, sys; "
+                "sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='cp1252'); "
+                "runpy.run_path(sys.argv[1], run_name='__main__')"
+            ),
+            str(guard),
+        ],
+        check=False,
+        input=json.dumps(
+            {
+                "hookEventName": "PreToolUse",
+                "toolName": "exec_command",
+                "toolInput": {"command": ["echo", "Łódź"]},
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+    assert response.returncode == 0, response.stderr
+    assert json.loads(response.stdout)["continue"] is True
+
+
+@pytest.mark.parametrize(
+    ("command", "env", "allowed"),
+    [
+        (["echo", "hello"], {}, True),
+        (["echo", "hello"], {"BASH_ENV": "/workspace/startup.sh"}, False),
+        (["echo", "hello"], {"PATH": "/workspace/bin"}, False),
+        (["echo", "hello"], {"GIT_SSH_COMMAND": "unreviewed-command"}, False),
+        (["echo", "hello"], None, False),
+        (["echo", "é" * 600_000], {}, False),
+    ],
+)
+def test_veltra_guard_checks_environment_and_input_byte_limit(
+    tmp_path: Path, command, env, allowed
+) -> None:
+    pytest.importorskip("veltra_agent.guardrail")
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    payload = json.dumps(
+        {
+            "hookEventName": "PreToolUse",
+            "toolName": "exec_command",
+            "toolInput": {"command": command, "env": env},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    response = subprocess.run(
+        [sys.executable, "-I", str(guard)],
+        check=False,
+        input=payload,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+    assert response.returncode == (1 if len(payload) > 1024 * 1024 else 0), (
+        response.stderr
+    )
+    assert json.loads(response.stdout)["continue"] is allowed

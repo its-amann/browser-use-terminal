@@ -9,23 +9,30 @@ import tempfile
 def main() -> None:
     decision = {"continue": False, "reason": "Veltra command inspection failed."}
     try:
-        raw = sys.stdin.read(1024 * 1024 + 1)
+        raw = sys.stdin.buffer.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             raise ValueError("Guard input is too large")
-        request = json.loads(raw)
+        request = json.loads(raw.decode("utf-8"))
         if request["hookEventName"] != "PreToolUse":
             raise ValueError("Unexpected guard event")
         tool_name = request["toolName"]
         if tool_name not in ("shell", "shell_command", "exec_command", "write_stdin"):
             raise ValueError("Unexpected command tool")
-        command = request["toolInput"]["command"]
+        tool_input = request["toolInput"]
+        command = tool_input["command"]
         if (
             not isinstance(command, list)
             or not command
             or not all(type(arg) is str for arg in command)
         ):
             raise ValueError("Expected a command argument list")
-        if tool_name == "write_stdin":
+        env = tool_input.get("env", {})
+        if not isinstance(env, dict) or env:
+            # Veltra's command-text rules cannot validate process environment overrides.
+            decision["reason"] = (
+                "Veltra does not support per-command environment overrides."
+            )
+        elif tool_name == "write_stdin":
             # Veltra accepts complete commands; separate input chunks can hide one.
             decision["reason"] = (
                 "Veltra does not support interactive input; use a complete command."
@@ -63,6 +70,8 @@ def main() -> None:
             }
     except Exception:  # noqa: BLE001 - scanner failures must deny without exposing payloads
         decision = {"continue": False, "reason": "Veltra command inspection failed."}
+        print(json.dumps(decision))
+        raise SystemExit(1) from None
     print(json.dumps(decision))
 
 

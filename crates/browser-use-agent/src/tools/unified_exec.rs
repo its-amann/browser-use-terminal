@@ -338,14 +338,31 @@ impl UnifiedExecManager {
         }
 
         if let Some(checker) = self.command_guard.as_deref() {
-            command_guard::inspect(
-                checker,
-                HookInput::new(HookEvent::PreToolUse)
-                    .with_tool_name(&req.tool_name)
-                    .with_tool_input(json!({"command": req.argv, "cwd": req.cwd}))
-                    .with_extra("callId", json!(req.call_id)),
-            )
-            .await?;
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(cancel) = req.cancel.as_ref() {
+                        cancel.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    return Err(ToolError::Rejected(
+                        "Command cancelled before execution.".into(),
+                    ));
+                }
+                result = command_guard::inspect(
+                    checker,
+                    HookInput::new(HookEvent::PreToolUse)
+                        .with_tool_name(&req.tool_name)
+                        .with_tool_input(json!({
+                            "command": req.argv,
+                            "cwd": req.cwd,
+                            "env": req.env,
+                        }))
+                        .with_extra("callId", json!(req.call_id)),
+                ) => result?,
+            }
             if req
                 .cancel
                 .as_ref()
@@ -1647,8 +1664,12 @@ mod tests {
             "printf allowed > marker.txt".into(),
         ];
 
+        let mut command = request(argv.clone(), dir.path().to_path_buf(), 1_000);
+        command
+            .env
+            .insert("GUARD_TEST_VALUE".into(), "hello".into());
         let result = manager
-            .run_to_completion(request(argv.clone(), dir.path().to_path_buf(), 1_000))
+            .run_to_completion(command)
             .await
             .expect("allowed command");
 
@@ -1658,6 +1679,11 @@ mod tests {
         assert_eq!(input["toolName"], "shell");
         assert_eq!(input["toolInput"]["command"], serde_json::json!(argv));
         assert_eq!(input["toolInput"]["cwd"], serde_json::json!(dir.path()));
+        assert_eq!(input["callId"], "test-call");
+        assert_eq!(
+            input["toolInput"]["env"],
+            serde_json::json!({"GUARD_TEST_VALUE": "hello"})
+        );
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("marker.txt")).unwrap(),
@@ -1738,7 +1764,7 @@ mod tests {
         let manager = UnifiedExecManager::deterministic_for_tests().with_command_guard(vec![
             "sh".into(),
             "-c".into(),
-            "cat >/dev/null; sleep 0.2; printf '{\"continue\":true}'".into(),
+            "cat >/dev/null; exec sleep 30".into(),
         ]);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut command = request(
@@ -1752,11 +1778,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             cancel.cancel();
         };
-        let (result, ()) = tokio::join!(pending, cancellation);
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pending, cancellation)
+        })
+        .await
+        .expect("cancellation must not wait for the checker timeout");
         manager.terminate_all().await;
         assert!(
-            result.is_err(),
-            "a cancelled command must not start after inspection"
+            matches!(result, Err(crate::tools::runtime::ToolError::Rejected(ref reason))
+                if reason == "Command cancelled before execution."),
+            "cancellation must return a cancellation error, not a guard denial"
         );
         assert!(!dir.path().join("should-not-exist").exists());
     }
@@ -1801,5 +1832,15 @@ mod tests {
             .await;
         assert!(denied.is_err());
         assert!(!dir.path().join("denied.txt").exists());
+        let mut with_env = request(
+            vec!["sh".into(), "-c".into(), "touch env-denied.txt".into()],
+            dir.path().to_path_buf(),
+            1_000,
+        );
+        with_env
+            .env
+            .insert("GUARD_TEST_VALUE".into(), "hello".into());
+        assert!(manager.run_to_completion(with_env).await.is_err());
+        assert!(!dir.path().join("env-denied.txt").exists());
     }
 }
