@@ -1,6 +1,9 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 from llm_browser_worker import worker
 
 
@@ -942,3 +945,96 @@ def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:
     assert "--headless=new" not in visible
     assert "--headless=new" in headless
     assert "--new-window" not in headless
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command", "chars", "allowed"),
+    [
+        (
+            "exec_command",
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('executed.txt').touch()",
+            ],
+            None,
+            True,
+        ),
+        ("shell", ["rm", "-rf", "/"], None, False),
+        ("exec_command", ["sh", "-c", "echo hello && rm -rf /"], None, False),
+        ("exec_command", ["sh", "-c", "echo $OPENAI_API_KEY"], None, False),
+        ("exec_command", ["curl", "http://example.test:9999"], None, False),
+        ("exec_command", ["sh", "-c", "echo hello >/etc/guard-test"], None, False),
+        ("write_stdin", ["sh"], "echo hello\n", False),
+    ],
+)
+def test_veltra_guard_inspects_without_executing(
+    tmp_path: Path, tool_name, command, chars, allowed
+) -> None:
+    pytest.importorskip("veltra_agent.guardrail")
+    # A task workspace must not be able to disable the configured guard.
+    (tmp_path / "veltra.config.json").write_text(
+        '{"forbidden_patterns":[],"chained_patterns":[]}'
+    )
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    response = subprocess.run(
+        [sys.executable, "-I", str(guard)],
+        check=False,
+        input=json.dumps(
+            {
+                "hookEventName": "PreToolUse",
+                "toolName": tool_name,
+                "toolInput": {"command": command, "cwd": str(tmp_path), "chars": chars},
+            }
+        ),
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    assert response.returncode == 0, response.stderr
+    assert json.loads(response.stdout)["continue"] is allowed
+    assert not (tmp_path / "veltra_audit.log").exists()
+    assert not (tmp_path / "executed.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "payload", ["not json", "{}", '{"toolInput":{"command":"echo hello"}}']
+)
+def test_veltra_guard_denies_malformed_input(tmp_path: Path, payload: str) -> None:
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    response = subprocess.run(
+        [sys.executable, "-I", str(guard)],
+        check=False,
+        input=payload,
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    assert response.returncode == 0, response.stderr
+    assert json.loads(response.stdout)["continue"] is False
+
+
+def test_veltra_guard_denies_when_dependency_is_unavailable(tmp_path: Path) -> None:
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    response = subprocess.run(
+        [sys.executable, "-I", "-S", str(guard)],
+        check=False,
+        input=json.dumps(
+            {
+                "hookEventName": "PreToolUse",
+                "toolName": "exec_command",
+                "toolInput": {"command": ["echo", "hello"]},
+            }
+        ),
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    assert response.returncode == 0, response.stderr
+    assert json.loads(response.stdout)["continue"] is False
