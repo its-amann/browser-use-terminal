@@ -1075,18 +1075,18 @@ def test_veltra_guard_reads_utf8_under_a_legacy_stdin_encoding(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    ("command", "env", "allowed"),
+    ("command", "env", "allowed", "exit_code"),
     [
-        (["echo", "hello"], {}, True),
-        (["echo", "hello"], {"BASH_ENV": "/workspace/startup.sh"}, False),
-        (["echo", "hello"], {"PATH": "/workspace/bin"}, False),
-        (["echo", "hello"], {"GIT_SSH_COMMAND": "unreviewed-command"}, False),
-        (["echo", "hello"], None, False),
-        (["echo", "é" * 600_000], {}, False),
+        (["echo", "hello"], {}, True, 0),
+        (["echo", "hello"], {"BASH_ENV": "/workspace/startup.sh"}, False, 0),
+        (["echo", "hello"], {"PATH": "/workspace/bin"}, False, 0),
+        (["echo", "hello"], {"GIT_SSH_COMMAND": "unreviewed-command"}, False, 0),
+        (["echo", "hello"], None, False, 0),
+        (["echo", "é" * 600_000], {}, False, 1),
     ],
 )
 def test_veltra_guard_checks_environment_and_input_byte_limit(
-    tmp_path: Path, command, env, allowed
+    tmp_path: Path, command, env, allowed, exit_code
 ) -> None:
     pytest.importorskip("veltra_agent.guardrail")
     guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
@@ -1106,7 +1106,40 @@ def test_veltra_guard_checks_environment_and_input_byte_limit(
         cwd=tmp_path,
         timeout=5,
     )
-    assert response.returncode == (1 if len(payload) > 1024 * 1024 else 0), (
-        response.stderr
+    assert response.returncode == exit_code, response.stderr
+    assert json.loads(response.stdout)["continue"] is allowed
+
+
+@pytest.mark.parametrize(
+    ("size", "allowed", "exit_code"),
+    [(1_048_576, True, 0), (1_048_577, False, 1)],
+)
+def test_veltra_guard_enforces_exact_input_byte_boundary(
+    tmp_path: Path, size: int, allowed: bool, exit_code: int
+) -> None:
+    pytest.importorskip("veltra_agent.guardrail")
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "veltra-command-guard.py"
+    payload = (
+        json.dumps(
+            {
+                "hookEventName": "PreToolUse",
+                "toolName": "exec_command",
+                "toolInput": {"command": ["echo", "hello"], "env": {}},
+            }
+        )
+        .encode("utf-8")
+        .ljust(size, b" ")
     )
+    assert len(payload) == size
+    # Both payloads are valid JSON; only their byte size should affect the verdict.
+    assert json.loads(payload)["toolInput"]["command"] == ["echo", "hello"]
+    response = subprocess.run(
+        [sys.executable, "-I", str(guard)],
+        check=False,
+        input=payload,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=5,
+    )
+    assert response.returncode == exit_code, response.stderr
     assert json.loads(response.stdout)["continue"] is allowed
